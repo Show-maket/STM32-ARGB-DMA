@@ -9,7 +9,14 @@
 #ifndef LIBS_H_
 #define LIBS_H_
 
-#include "main.h"    ///< Main project file
+// Arduino/STM32duino uses stm32_def.h instead of CubeMX main.h
+// Added by DashyFox for Arduino/STM32duino port
+#if defined(ARDUINO) || defined(ARDUINO_ARCH_STM32)
+#include "stm32_def.h"
+#else
+#include "main.h"    ///< CubeMX main project file
+#endif
+
 #include <stdlib.h>  ///< Standard library
 #include <stdint.h>  ///< Std types
 #include <stdbool.h> ///< _Bool to bool

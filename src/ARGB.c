@@ -10,6 +10,10 @@
  *
  * @note Repo: https://github.com/Crazy-Geeks/STM32-ARGB-DMA
  * @note RU article: https://crazygeeks.ru/stm32-argb-lib
+ * 
+ * @note Arduino/STM32duino port by DashyFox:
+ *       - Added ARGB_Attach() for runtime TIM/DMA binding
+ *       - Added conditional compilation for Arduino support
  */
 
 /* WS2811 Timings
@@ -92,27 +96,44 @@ typedef u16_t dma_siz;
 typedef u32_t dma_siz;
 #endif
 
+// For Arduino/STM32duino: use runtime binding only (no CubeMX externs)
+#if defined(ARDUINO) || defined(ARDUINO_ARCH_STM32)
+#define ARGB_USE_RUNTIME_BINDING
+#endif
+
+// Legacy CubeMX-style externs (when not using ARGB_Attach)
+#ifndef ARGB_USE_RUNTIME_BINDING
 extern TIM_HandleTypeDef (TIM_HANDLE);  ///< Timer handler
 extern DMA_HandleTypeDef (DMA_HANDLE);  ///< DMA handler
+#endif
+
+// Runtime binding pointers (set by ARGB_Attach)
+static TIM_HandleTypeDef* s_htim = NULL;
+static DMA_HandleTypeDef* s_hdma = NULL;
+static u32_t s_tim_channel = 0;
+static volatile u32_t* s_tim_ccr = NULL;
+static u32_t s_tim_dma_cc = 0;
+static u32_t s_timer_clock_hz = 0;
 
 volatile u8_t PWM_HI;    ///< PWM Code HI Log.1 period
 volatile u8_t PWM_LO;    ///< PWM Code LO Log.1 period
 
 #ifdef SK6812
-#define NUM_BYTES (4 * NUM_PIXELS) ///< Strip size in bytes
-#define PWM_BUF_LEN (4 * 8 * 2)    ///< Pack len * 8 bit * 2 LEDs
+#define NUM_BYTES (4 * NUM_PIXELS)          ///< Strip size in bytes (RGBW)
+#define BITS_PER_PIXEL (4 * 8)              ///< 32 bits per RGBW pixel
 #else
-#define NUM_BYTES (3 * NUM_PIXELS) ///< Strip size in bytes
-#define PWM_BUF_LEN (3 * 8 * 2)    ///< Pack len * 8 bit * 2 LEDs
+#define NUM_BYTES (3 * NUM_PIXELS)          ///< Strip size in bytes (RGB)
+#define BITS_PER_PIXEL (3 * 8)              ///< 24 bits per RGB pixel
 #endif
+
+#define RST_LEN 60                          ///< Reset period (60+ bits of LOW = 75us @ 800kHz)
+#define PWM_BUF_LEN (NUM_PIXELS * BITS_PER_PIXEL + RST_LEN)  ///< Full buffer for all pixels + reset
 
 /// Static LED buffer
 volatile u8_t RGB_BUF[NUM_BYTES] = {0,};
 
-/// Timer PWM value buffer
+/// Timer PWM value buffer - holds ALL data for complete DMA transfer
 volatile dma_siz PWM_BUF[PWM_BUF_LEN] = {0,};
-/// PWM buffer iterator
-volatile u16_t BUF_COUNTER = 0;
 
 volatile u8_t ARGB_BR = 255;     ///< LED Global brightness
 volatile ARGB_STATE ARGB_LOC_ST; ///< Buffer send status
@@ -125,28 +146,73 @@ static void ARGB_TIM_DMADelayPulseHalfCplt(DMA_HandleTypeDef *hdma);
 /// @} //Private
 
 /**
+ * @brief Runtime binding to TIM/DMA (Arduino-friendly)
+ * @note Added by DashyFox for Arduino/STM32duino port
+ *       Allows dynamic binding instead of compile-time extern declarations
+ */
+ARGB_STATE ARGB_Attach(TIM_HandleTypeDef* htim, u32_t tim_channel,
+                       DMA_HandleTypeDef* hdma, u32_t timer_clock_hz) {
+    if (!htim || !hdma) return ARGB_PARAM_ERR;
+    
+    s_htim = htim;
+    s_hdma = hdma;
+    s_tim_channel = tim_channel;
+    s_timer_clock_hz = timer_clock_hz;
+    
+    // Get CCR register address
+    switch (tim_channel) {
+        case TIM_CHANNEL_1: s_tim_ccr = &htim->Instance->CCR1; s_tim_dma_cc = TIM_DMA_CC1; break;
+        case TIM_CHANNEL_2: s_tim_ccr = &htim->Instance->CCR2; s_tim_dma_cc = TIM_DMA_CC2; break;
+        case TIM_CHANNEL_3: s_tim_ccr = &htim->Instance->CCR3; s_tim_dma_cc = TIM_DMA_CC3; break;
+        case TIM_CHANNEL_4: s_tim_ccr = &htim->Instance->CCR4; s_tim_dma_cc = TIM_DMA_CC4; break;
+        default: return ARGB_PARAM_ERR;
+    }
+    return ARGB_OK;
+}
+
+/**
  * @brief Init timer & prescalers
  * @param none
  */
 void ARGB_Init(void) {
     /* Auto-calculation! */
     u32_t APBfq; // Clock freq
+    
+    // Use runtime binding if available, otherwise legacy defines
+    TIM_TypeDef* tim_inst;
+    u32_t tim_ch;
+    
+    if (s_htim != NULL) {
+        // Runtime binding mode (ARGB_Attach was called)
+        tim_inst = s_htim->Instance;
+        tim_ch = s_tim_channel;
+        APBfq = s_timer_clock_hz;
+    } else {
+#ifndef ARGB_USE_RUNTIME_BINDING
+        // Legacy CubeMX mode
+        tim_inst = TIM_HANDLE.Instance;
+        tim_ch = TIM_CH;
 #ifdef APB1
-    APBfq = HAL_RCC_GetPCLK1Freq();
-    APBfq *= (RCC->CFGR & RCC_CFGR_PPRE1) == 0 ? 1 : 2;
+        APBfq = HAL_RCC_GetPCLK1Freq();
+        APBfq *= (RCC->CFGR & RCC_CFGR_PPRE1) == 0 ? 1 : 2;
+#else
+        APBfq = HAL_RCC_GetPCLK2Freq();
+        APBfq *= (RCC->CFGR & RCC_CFGR_PPRE2) == 0 ? 1 : 2;
 #endif
-#ifdef APB2
-    APBfq = HAL_RCC_GetPCLK2Freq();
-    APBfq *= (RCC->CFGR & RCC_CFGR_PPRE2) == 0 ? 1 : 2;
+#else
+        return; // No timer configured
 #endif
+    }
+
 #ifdef WS2811S
     APBfq /= (uint32_t) (400 * 1000);  // 400 KHz - 2.5us
 #else
     APBfq /= (uint32_t) (800 * 1000);  // 800 KHz - 1.25us
 #endif
-    TIM_HANDLE.Instance->PSC = 0;                        // dummy hardcode now
-    TIM_HANDLE.Instance->ARR = (uint16_t) (APBfq - 1);   // set timer prescaler
-    TIM_HANDLE.Instance->EGR = 1;                        // update timer registers
+    tim_inst->PSC = 0;                        // no prescaler
+    tim_inst->ARR = (uint16_t) (APBfq - 1);   // set timer period
+    tim_inst->EGR = 1;                        // update registers
+    
 #if defined(WS2811F) || defined(WS2811S)
     PWM_HI = (u8_t) (APBfq * 0.48) - 1;     // Log.1 - 48% - 0.60us/1.2us
     PWM_LO = (u8_t) (APBfq * 0.20) - 1;     // Log.0 - 20% - 0.25us/0.5us
@@ -160,13 +226,8 @@ void ARGB_Init(void) {
     PWM_LO = (u8_t) (APBfq * 0.24) - 1;     // Log.0 - 24% - 0.30us
 #endif
 
-//#if INV_SIGNAL
-//    TIM_POINTER->CCER |= TIM_CCER_CC2P; // set inv ch bit
-//#else
-//    TIM_POINTER->CCER &= ~TIM_CCER_CC2P;
-//#endif
     ARGB_LOC_ST = ARGB_READY; // Set Ready Flag
-    TIM_CCxChannelCmd(TIM_HANDLE.Instance, TIM_CH, TIM_CCx_ENABLE); // Enable GPIO to IDLE state
+    TIM_CCxChannelCmd(tim_inst, tim_ch, TIM_CCx_ENABLE); // Enable GPIO to IDLE state
     HAL_Delay(1); // Make some delay
 }
 
@@ -301,79 +362,104 @@ ARGB_STATE ARGB_Ready(void) {
 }
 
 /**
- * @brief Update strip
+ * @brief Update strip - fills entire PWM buffer and starts single DMA transfer
  * @param none
  * @return #ARGB_STATE enum
  */
 ARGB_STATE ARGB_Show(void) {
-    ARGB_LOC_ST = ARGB_BUSY;
-    if (BUF_COUNTER != 0 || DMA_HANDLE.State != HAL_DMA_STATE_READY) {
-        return ARGB_BUSY;
+    // Get handles - runtime or legacy
+    TIM_HandleTypeDef* htim;
+    DMA_HandleTypeDef* hdma;
+    u32_t tim_ch, tim_dma_cc;
+    volatile u32_t* ccr_reg;
+    
+    if (s_htim != NULL) {
+        htim = s_htim;
+        hdma = s_hdma;
+        tim_ch = s_tim_channel;
+        tim_dma_cc = s_tim_dma_cc;
+        ccr_reg = s_tim_ccr;
     } else {
-        for (volatile u8_t i = 0; i < 8; i++) {
-            // set first transfer from first values
-            PWM_BUF[i] = (((RGB_BUF[0] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 8] = (((RGB_BUF[1] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 16] = (((RGB_BUF[2] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 24] = (((RGB_BUF[3] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 32] = (((RGB_BUF[4] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 40] = (((RGB_BUF[5] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-#ifdef SK6812
-            PWM_BUF[i + 48] = (((RGB_BUF[6] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 56] = (((RGB_BUF[7] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-#endif
-        }
-        HAL_StatusTypeDef DMA_Send_Stat = HAL_ERROR;
-        while (DMA_Send_Stat != HAL_OK) {
-            if (TIM_CHANNEL_STATE_GET(&TIM_HANDLE, TIM_CH) == HAL_TIM_CHANNEL_STATE_BUSY) {
-                DMA_Send_Stat = HAL_BUSY;
-                continue;
-            } else if (TIM_CHANNEL_STATE_GET(&TIM_HANDLE, TIM_CH) == HAL_TIM_CHANNEL_STATE_READY) {
-                TIM_CHANNEL_STATE_SET(&TIM_HANDLE, TIM_CH, HAL_TIM_CHANNEL_STATE_BUSY);
-            } else {
-                DMA_Send_Stat = HAL_ERROR;
-                continue;
-            }
+#ifndef ARGB_USE_RUNTIME_BINDING
+        htim = &TIM_HANDLE;
+        hdma = &DMA_HANDLE;
+        tim_ch = TIM_CH;
 #if TIM_CH == TIM_CHANNEL_1
-#define ARGB_TIM_DMA_ID TIM_DMA_ID_CC1
-#define ARGB_TIM_DMA_CC TIM_DMA_CC1
-#define ARGB_TIM_CCR CCR1
+        tim_dma_cc = TIM_DMA_CC1;
+        ccr_reg = &htim->Instance->CCR1;
 #elif TIM_CH == TIM_CHANNEL_2
-#define ARGB_TIM_DMA_ID TIM_DMA_ID_CC2
-#define ARGB_TIM_DMA_CC TIM_DMA_CC2
-#define ARGB_TIM_CCR CCR2
+        tim_dma_cc = TIM_DMA_CC2;
+        ccr_reg = &htim->Instance->CCR2;
 #elif TIM_CH == TIM_CHANNEL_3
-#define ARGB_TIM_DMA_ID TIM_DMA_ID_CC3
-#define ARGB_TIM_DMA_CC TIM_DMA_CC3
-#define ARGB_TIM_CCR CCR3
-#elif TIM_CH == TIM_CHANNEL_4
-#define ARGB_TIM_DMA_ID TIM_DMA_ID_CC4
-#define ARGB_TIM_DMA_CC TIM_DMA_CC4
-#define ARGB_TIM_CCR CCR4
+        tim_dma_cc = TIM_DMA_CC3;
+        ccr_reg = &htim->Instance->CCR3;
+#else
+        tim_dma_cc = TIM_DMA_CC4;
+        ccr_reg = &htim->Instance->CCR4;
 #endif
-            TIM_HANDLE.hdma[ARGB_TIM_DMA_ID]->XferCpltCallback = ARGB_TIM_DMADelayPulseCplt;
-            TIM_HANDLE.hdma[ARGB_TIM_DMA_ID]->XferHalfCpltCallback = ARGB_TIM_DMADelayPulseHalfCplt;
-            TIM_HANDLE.hdma[ARGB_TIM_DMA_ID]->XferErrorCallback = TIM_DMAError;
-            if (HAL_DMA_Start_IT(TIM_HANDLE.hdma[ARGB_TIM_DMA_ID], (u32_t) PWM_BUF,
-                                 (u32_t) &TIM_HANDLE.Instance->ARGB_TIM_CCR,
-                                 (u16_t) PWM_BUF_LEN) != HAL_OK) {
-                DMA_Send_Stat = HAL_ERROR;
-                continue;
-            }
-            __HAL_TIM_ENABLE_DMA(&TIM_HANDLE, ARGB_TIM_DMA_CC);
-            if (IS_TIM_BREAK_INSTANCE(TIM_HANDLE.Instance) != RESET)
-                __HAL_TIM_MOE_ENABLE(&TIM_HANDLE);
-            if (IS_TIM_SLAVE_INSTANCE(TIM_HANDLE.Instance)) {
-                u32_t tmpsmcr = TIM_HANDLE.Instance->SMCR & TIM_SMCR_SMS;
-                if (!IS_TIM_SLAVEMODE_TRIGGER_ENABLED(tmpsmcr))
-                    __HAL_TIM_ENABLE(&TIM_HANDLE);
-            } else
-                __HAL_TIM_ENABLE(&TIM_HANDLE);
-            DMA_Send_Stat = HAL_OK;
-        }
-        BUF_COUNTER = 2;
-        return ARGB_OK;
+#else
+        return ARGB_PARAM_ERR;
+#endif
     }
+
+    // Check if DMA is ready
+    if (ARGB_LOC_ST == ARGB_BUSY || hdma->State != HAL_DMA_STATE_READY) {
+        return ARGB_BUSY;
+    }
+    ARGB_LOC_ST = ARGB_BUSY;
+    
+    // Fill ENTIRE PWM buffer with all pixel data
+    u16_t pwm_idx = 0;
+    for (u16_t byte_idx = 0; byte_idx < NUM_BYTES; byte_idx++) {
+        u8_t byte_val = RGB_BUF[byte_idx];
+        for (u8_t bit = 0; bit < 8; bit++) {
+            PWM_BUF[pwm_idx++] = (byte_val & 0x80) ? PWM_HI : PWM_LO;
+            byte_val <<= 1;
+        }
+    }
+    
+    // Add reset period (zeros for LOW signal)
+    for (u16_t i = 0; i < RST_LEN; i++) {
+        PWM_BUF[pwm_idx++] = 0;
+    }
+    
+    // Clear CCR before starting to avoid initial glitch
+    *ccr_reg = 0;
+    htim->Instance->CNT = 0;
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_UPDATE | TIM_FLAG_CC1 | TIM_FLAG_CC2 | TIM_FLAG_CC3 | TIM_FLAG_CC4);
+    
+    // Get DMA ID from channel
+    u32_t dma_id = (tim_ch == TIM_CHANNEL_1) ? TIM_DMA_ID_CC1 :
+                   (tim_ch == TIM_CHANNEL_2) ? TIM_DMA_ID_CC2 :
+                   (tim_ch == TIM_CHANNEL_3) ? TIM_DMA_ID_CC3 : TIM_DMA_ID_CC4;
+    
+    // Set channel state
+    TIM_CHANNEL_STATE_SET(htim, tim_ch, HAL_TIM_CHANNEL_STATE_BUSY);
+    
+    // Setup callbacks
+    htim->hdma[dma_id]->XferCpltCallback = ARGB_TIM_DMADelayPulseCplt;
+    htim->hdma[dma_id]->XferHalfCpltCallback = NULL;  // Not needed for NORMAL mode
+    htim->hdma[dma_id]->XferErrorCallback = TIM_DMAError;
+    
+    // Start DMA for entire buffer
+    if (HAL_DMA_Start_IT(htim->hdma[dma_id], (u32_t)PWM_BUF,
+                         (u32_t)ccr_reg, (u16_t)PWM_BUF_LEN) != HAL_OK) {
+        ARGB_LOC_ST = ARGB_READY;
+        TIM_CHANNEL_STATE_SET(htim, tim_ch, HAL_TIM_CHANNEL_STATE_READY);
+        return ARGB_PARAM_ERR;
+    }
+    
+    // Enable DMA request from timer
+    __HAL_TIM_ENABLE_DMA(htim, tim_dma_cc);
+    
+    // Enable timer output for advanced timers (TIM1, TIM8)
+    if (IS_TIM_BREAK_INSTANCE(htim->Instance) != RESET)
+        __HAL_TIM_MOE_ENABLE(htim);
+    
+    // Start timer
+    __HAL_TIM_ENABLE(htim);
+    
+    return ARGB_OK;
 }
 
 /**
@@ -436,119 +522,54 @@ static void HSV2RGB(u8_t hue, u8_t sat, u8_t val, u8_t *_r, u8_t *_g, u8_t *_b) 
 }
 
 /**
-  * @brief  TIM DMA Delay Pulse complete callback.
+  * @brief  TIM DMA Delay Pulse complete callback (NORMAL mode).
+  *         Called when entire PWM buffer has been transmitted.
   * @param  hdma pointer to DMA handle.
   * @retval None
   */
 static void ARGB_TIM_DMADelayPulseCplt(DMA_HandleTypeDef *hdma) {
-    TIM_HandleTypeDef *htim = (TIM_HandleTypeDef *) ((DMA_HandleTypeDef *) hdma)->Parent;
-    // if wrong handlers
-    if (hdma != &DMA_HANDLE || htim != &TIM_HANDLE) return;
-    if (BUF_COUNTER == 0) return; // if no data to transmit - return
-    if (hdma == htim->hdma[TIM_DMA_ID_CC1]) {
-        htim->Channel = HAL_TIM_ACTIVE_CHANNEL_1;
-        if (hdma->Init.Mode == DMA_NORMAL) {
-            TIM_CHANNEL_STATE_SET(htim, TIM_CHANNEL_1, HAL_TIM_CHANNEL_STATE_READY);
-        }
-    } else if (hdma == htim->hdma[TIM_DMA_ID_CC2]) {
-        htim->Channel = HAL_TIM_ACTIVE_CHANNEL_2;
-        if (hdma->Init.Mode == DMA_NORMAL) {
-            TIM_CHANNEL_STATE_SET(htim, TIM_CHANNEL_2, HAL_TIM_CHANNEL_STATE_READY);
-        }
-    } else if (hdma == htim->hdma[TIM_DMA_ID_CC3]) {
-        htim->Channel = HAL_TIM_ACTIVE_CHANNEL_3;
-        if (hdma->Init.Mode == DMA_NORMAL) {
-            TIM_CHANNEL_STATE_SET(htim, TIM_CHANNEL_3, HAL_TIM_CHANNEL_STATE_READY);
-        }
-    } else if (hdma == htim->hdma[TIM_DMA_ID_CC4]) {
-        htim->Channel = HAL_TIM_ACTIVE_CHANNEL_4;
-        if (hdma->Init.Mode == DMA_NORMAL) {
-            TIM_CHANNEL_STATE_SET(htim, TIM_CHANNEL_4, HAL_TIM_CHANNEL_STATE_READY);
-        }
+    TIM_HandleTypeDef *htim = (TIM_HandleTypeDef *) hdma->Parent;
+    
+    // Get channel info
+    u32_t tim_ch, tim_dma_cc;
+    if (s_htim != NULL) {
+        tim_ch = s_tim_channel;
+        tim_dma_cc = s_tim_dma_cc;
     } else {
-        /* nothing to do */
-    }
-// if data transfer
-    if (BUF_COUNTER < NUM_PIXELS) {
-        // fill second part of buffer
-        for (volatile u8_t i = 0; i < 8; i++) {
-#ifdef SK6812
-            PWM_BUF[i + 32] = (((RGB_BUF[4 * BUF_COUNTER] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 40] = (((RGB_BUF[4 * BUF_COUNTER + 1] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 48] = (((RGB_BUF[4 * BUF_COUNTER + 2] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 56] = (((RGB_BUF[4 * BUF_COUNTER + 3] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
+#ifndef ARGB_USE_RUNTIME_BINDING
+        tim_ch = TIM_CH;
+        tim_dma_cc = (TIM_CH == TIM_CHANNEL_1) ? TIM_DMA_CC1 :
+                     (TIM_CH == TIM_CHANNEL_2) ? TIM_DMA_CC2 :
+                     (TIM_CH == TIM_CHANNEL_3) ? TIM_DMA_CC3 : TIM_DMA_CC4;
 #else
-            PWM_BUF[i + 24] = (((RGB_BUF[3 * BUF_COUNTER] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 32] = (((RGB_BUF[3 * BUF_COUNTER + 1] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 40] = (((RGB_BUF[3 * BUF_COUNTER + 2] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
+        return;  // No valid configuration
 #endif
-        }
-        BUF_COUNTER++;
-    } else if (BUF_COUNTER < NUM_PIXELS + 2) { // if RET transfer
-        memset((dma_siz *) &PWM_BUF[PWM_BUF_LEN / 2], 0, (PWM_BUF_LEN / 2)*sizeof(dma_siz)); // second part
-        BUF_COUNTER++;
-    } else { // if END of transfer
-        BUF_COUNTER = 0;
-        // STOP DMA:
-#if TIM_CH == TIM_CHANNEL_1
-        __HAL_TIM_DISABLE_DMA(htim, TIM_DMA_CC1);
-        (void) HAL_DMA_Abort_IT(htim->hdma[TIM_DMA_ID_CC1]);
-#endif
-#if TIM_CH == TIM_CHANNEL_2
-        __HAL_TIM_DISABLE_DMA(htim, TIM_DMA_CC2);
-        (void) HAL_DMA_Abort_IT(htim->hdma[TIM_DMA_ID_CC2]);
-#endif
-#if TIM_CH == TIM_CHANNEL_3
-        __HAL_TIM_DISABLE_DMA(htim, TIM_DMA_CC3);
-        (void) HAL_DMA_Abort_IT(htim->hdma[TIM_DMA_ID_CC3]);
-#endif
-#if TIM_CH == TIM_CHANNEL_4
-        __HAL_TIM_DISABLE_DMA(htim, TIM_DMA_CC4);
-        (void) HAL_DMA_Abort_IT(htim->hdma[TIM_DMA_ID_CC4]);
-#endif
-        if (IS_TIM_BREAK_INSTANCE(htim->Instance) != RESET) {
-            /* Disable the Main Output */
-            __HAL_TIM_MOE_DISABLE(htim);
-        }
-        /* Disable the Peripheral */
-        __HAL_TIM_DISABLE(htim);
-        /* Set the TIM channel state */
-        TIM_CHANNEL_STATE_SET(htim, TIM_CH, HAL_TIM_CHANNEL_STATE_READY);
-        ARGB_LOC_ST = ARGB_READY;
     }
+    
+    // Stop DMA and timer
+    __HAL_TIM_DISABLE_DMA(htim, tim_dma_cc);
+    
+    if (IS_TIM_BREAK_INSTANCE(htim->Instance) != RESET)
+        __HAL_TIM_MOE_DISABLE(htim);
+    __HAL_TIM_DISABLE(htim);
+    
+    // Set channel state to ready
+    TIM_CHANNEL_STATE_SET(htim, tim_ch, HAL_TIM_CHANNEL_STATE_READY);
+    
+    // Clear active channel
     htim->Channel = HAL_TIM_ACTIVE_CHANNEL_CLEARED;
+    
+    // Signal completion
+    ARGB_LOC_ST = ARGB_READY;
 }
 
 /**
-  * @brief  TIM DMA Delay Pulse half complete callback.
+  * @brief  TIM DMA Delay Pulse half complete callback (unused in NORMAL mode).
   * @param  hdma pointer to DMA handle.
   * @retval None
   */
 static void ARGB_TIM_DMADelayPulseHalfCplt(DMA_HandleTypeDef *hdma) {
-    TIM_HandleTypeDef *htim = (TIM_HandleTypeDef *) ((DMA_HandleTypeDef *) hdma)->Parent;
-    // if wrong handlers
-    if (hdma != &DMA_HANDLE || htim != &TIM_HANDLE) return;
-    if (BUF_COUNTER == 0) return; // if no data to transmit - return
-    // if data transfer
-    if (BUF_COUNTER < NUM_PIXELS) {
-        // fill first part of buffer
-        for (volatile u8_t i = 0; i < 8; i++) {
-#ifdef SK6812
-            PWM_BUF[i] = (((RGB_BUF[4 * BUF_COUNTER] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 8] = (((RGB_BUF[4 * BUF_COUNTER + 1] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 16] = (((RGB_BUF[4 * BUF_COUNTER + 2] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 24] = (((RGB_BUF[4 * BUF_COUNTER + 3] << i) & 0x80) > 0)? PWM_HI : PWM_LO;
-#else
-            PWM_BUF[i] = (((RGB_BUF[3 * BUF_COUNTER] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 8] = (((RGB_BUF[3 * BUF_COUNTER + 1] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-            PWM_BUF[i + 16] = (((RGB_BUF[3 * BUF_COUNTER + 2] << i) & 0x80) > 0) ? PWM_HI : PWM_LO;
-#endif
-        }
-        BUF_COUNTER++;
-    } else if (BUF_COUNTER < NUM_PIXELS + 2) { // if RET transfer
-        memset((dma_siz *) &PWM_BUF[0], 0, (PWM_BUF_LEN / 2)*sizeof(dma_siz)); // first part
-        BUF_COUNTER++;
-    }
+    (void)hdma;  // Unused in NORMAL mode
 }
 
 /** @} */ // Private
@@ -561,10 +582,11 @@ static void ARGB_TIM_DMADelayPulseHalfCplt(DMA_HandleTypeDef *hdma) {
 #warning Set it from list in ARGB.h string 29
 #endif
 
-// Check channel
+// Check channel (only for legacy CubeMX mode)
+#ifndef ARGB_USE_RUNTIME_BINDING
 #if !(TIM_CH == TIM_CHANNEL_1 || TIM_CH == TIM_CHANNEL_2 || TIM_CH == TIM_CHANNEL_3 || TIM_CH == TIM_CHANNEL_4)
 #error Wrong channel! Fix it in ARGB.h string 40
-#warning If you shure, search and set TIM_CHANNEL by yourself
+#endif
 #endif
 
 // Check DMA Size

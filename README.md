@@ -1,112 +1,177 @@
-## STM32-ARGB-DMA
- **Fastest** and **simplest** library for **ARGB LEDs**: *WS28xx* and *SK68xx* Series *RGB* or *RGBW* for *STM32* Series. 
-<br> Uses ***DMA Interrupts*** and ***PWM*** to control LED Strip
+# STM32-ARGB-DMA
 
-![Banner](Resources/ARGB_Banner.png)
+**Arduino/STM32duino port** of the [STM32-ARGB-DMA](https://github.com/Crazy-Geeks/STM32-ARGB-DMA) library for addressable RGB LEDs (WS2812, WS2811, SK6812).
 
-> ### [RU Description](https://crazygeeks.ru/stm32-argb-lib )
-> ### [RU Habr](https://habr.com/ru/post/664934/ )
- 
-### Features:
-- Can be used for **addressable RGB** and **RGBW LED** strips
-- Uses double-buffer and half-ready **DMA interrupts**, so RAM **consumption is small**
-- Uses standard neopixel's **800/400 KHz** protocol
-- Supports ***RGB*** and ***HSV*** color models
-- Timer frequency **auto-calculation**
+Uses **DMA** to drive LED strips without blocking the CPU or disabling interrupts.
 
-### Limitations
-- Only supports **APBx frequency >32 MHz**. It's timers' limitations.
+## ✅ Tested Configuration
 
-### Lib settings
-```c
-#define WS2812       // Family: {WS2811S, WS2811F, WS2812, SK6812}
-// WS2811S — RGB, 400kHz;
-// WS2811F — RGB, 800kHz;
-// WS2812  — GRB, 800kHz;
-// SK6812  — RGBW, 800kHz
+| Component | Version |
+|-----------|---------|
+| STM32duino Core | **2.8.1** |
+| Board | Nucleo F401RE |
+| LED Type | WS2812B |
 
-#define NUM_PIXELS 5 // Pixel quantity
+## Features
 
-#define USE_GAMMA_CORRECTION 1 // Gamma-correction should fix red&green, try for yourself
+- Non-blocking DMA transfer (CPU free during transmission)
+- Supports WS2812/WS2811/SK6812 (RGB and RGBW)
+- Auto-batching: multiple `Show()` calls are queued, not dropped
+- HSV and RGB color models
+- Automatic pin/timer/DMA configuration helpers
 
-#define TIM_NUM	   2  // Timer number
-#define TIM_CH	   TIM_CHANNEL_2  // Timer's PWM channel
-#define DMA_HANDLE hdma_tim2_ch2_ch4  // DMA Channel
-#define DMA_SIZE_WORD     // DMA Memory Data Width: {.._BYTE, .._HWORD, .._WORD}
-// DMA channel can be found in main.c / tim.c
+## Quick Start
+
+### Automatic Configuration (Recommended)
+
+```cpp
+#include <ARGB.h>
+#include <ARGB_Auto.h>
+
+#define LED_PIN PA0
+#define NUM_PIXELS 4
+
+void setup() {
+    // Check if pin supports PWM+DMA
+    ARGB_PinConfig_t cfg;
+    if (ARGB_AnalyzePin(LED_PIN, &cfg) != ARGB_DMA_OK) {
+        Serial.println("Pin not supported!");
+        return;
+    }
+    
+    // ... setup TIM and DMA using cfg values ...
+    // See examples for full code
+}
 ```
 
-### Function reference (from .h file):
-```c
-// API enum status
-typedef enum ARGB_STATE {
-    ARGB_BUSY = 0,      // DMA Transfer in progress
-    ARGB_READY = 1,     // DMA Ready to transfer
-    ARGB_OK = 2,        // Function execution success
-    ARGB_PARAM_ERR = 3, // Error in input parameters
-} ARGB_STATE;
+### Manual Configuration (Full Control)
 
-void ARGB_Init(void);   // Initialization
-void ARGB_Clear(void);  // Clear strip
+```cpp
+#define NUM_PIXELS 4
+#define WS2812
+#define DMA_SIZE_WORD  // Required for TIM2/TIM5 (32-bit timers)
+#include <ARGB.h>
 
-void ARGB_SetBrightness(u8_t br); // Set global brightness
-
-void ARGB_SetRGB(u16_t i, u8_t r, u8_t g, u8_t b);  // Set single LED by RGB
-void ARGB_SetHSV(u16_t i, u8_t hue, u8_t sat, u8_t val); // Set single LED by HSV
-void ARGB_SetWhite(u16_t i, u8_t w); // Set white component in LED (RGBW)
-
-void ARGB_FillRGB(u8_t r, u8_t g, u8_t b); // Fill all strip with RGB color
-void ARGB_FillHSV(u8_t hue, u8_t sat, u8_t val); // Fill all strip with HSV color
-void ARGB_FillWhite(u8_t w); // Fill all strip's white component (RGBW)
-
-ARGB_STATE ARGB_Ready(void); // Get DMA Ready state
-ARGB_STATE ARGB_Show(void); // Push data to the strip
-```
-
-### Connection
-![Connection](Resources/ARGB_Scheme.png)
-
-### Instructions for use: 
-> #### [Also available in PDF (RU/EN)](https://github.com/Crazy-Geeks/STM32-ARGB-DMA/tree/master/Instructions )
-- Use *CubeMX* to configure clocks and peripheral.
-- Enable *PWM Generation* for your preferred timer channel.
-- ***PWM Mode 1***,  ***OC Preload**: Enable*, ***Fast Mode**: Disable*, ***CH Polarity**: High*
-- Enable **DMA** for your timer channel with **"Memory To Peripheral"** direction.
-- Set *DMA* mode to **Circular**, *Data Width* to **Word**/**Byte**, *Increment Address* checkbox only for **Memory**.
-- Set *GPIO Speed* to the **Maximum**, use **Open Drain** or **Push Pull** Mode - details in **Troubleshooting**.
-- Save CubeMX .ioc file and generate code.
-- Add library to your source destination and add #include in your code. 
-- In **main.c** file search for your DMA Handler
-```c
-/* Private variables */
 TIM_HandleTypeDef htim2;
-DMA_HandleTypeDef hdma_tim2_ch2_ch4;  <-- THIS
+DMA_HandleTypeDef hdma;
+
+void setup() {
+    // 1. Init GPIO for TIM2_CH1 on PA0
+    // 2. Init TIM2 with HAL_TIM_PWM_Init()
+    // 3. Init DMA1_Stream5_Channel3
+    // 4. Call ARGB_Attach() and ARGB_Init()
+}
 ```
-- Add this handler in **ARGB.h** file in **DMA HANDLE** define.
-- Set other defines with your settings.
-- Now we're ready to go!
 
-### TROUBLESHOOTING
-- **IF STRIP DOESN'T WORK**
-    - You should **convert logic levels**
-        - In **Push Pull** GPIO Mode use **SN74LVC** Translator
-        - In **Open Drain** GPIO Mode use **1K PullUp** Resistor 
-    - Check HAL DMA Generation order. DMA_Init should be **higher** than TIM_Init
-![DMA_Order](Resources/DMA_Gen_Order.png)
-    
-- **COLOR NOISE**
-    - Use _Logic Analyzer_ or _Oscilloscope_ to **measure** the signal, or just play with values
-        - Correct timer values in **.c** file **152 string**
-- **ANY OTHER** 
-  - Write an [**issue**](https://github.com/Crazy-Geeks/STM32-ARGB-DMA/issues )!
+## ⚠️ Critical Notes
 
-### Suggestions
-- Write an [**issue**](https://github.com/Crazy-Geeks/STM32-ARGB-DMA/issues ) or use [**pull request**](https://github.com/Crazy-Geeks/STM32-ARGB-DMA/pulls )
-    
-### Special thanks
-[**NarodStream**](https://narodstream.ru/stm-urok-119-ws2812b-lenta-na-umnyx-svetodiodax-rgb-chast-2 ), [**VFD**](https://www.thevfdcollective.com/blog/stm32-and-sk6812-rgbw-led )
+### 32-bit Timers (TIM2, TIM5)
 
-### Donate options
-- [My Site (RU)](https://crazygeeks.ru/donate/ ) 
-- [PayPal](https://paypal.me/yasnosos )
-- [DonationAlerts](https://www.donationalerts.com/r/yasnosos )
+On STM32F4, TIM2 and TIM5 are 32-bit timers with 32-bit CCR registers.
+**DMA MUST use WORD (32-bit) alignment**, otherwise CCR won't update correctly!
+
+```cpp
+// In your code BEFORE including ARGB.h:
+#define DMA_SIZE_WORD
+
+// In DMA init:
+hdma.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+hdma.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+```
+
+### DMA Stream Conflicts
+
+Each DMA stream can only be used by one peripheral. If your stream is already used
+(e.g., by SPI, I2C, UART), use an alternate mapping:
+
+| Timer | Channel | Primary Stream | Alternate Stream |
+|-------|---------|----------------|------------------|
+| TIM2  | CH1     | DMA1_Stream5   | DMA1_Stream1     |
+| TIM2  | CH4     | DMA1_Stream7   | DMA1_Stream6     |
+| TIM5  | CH4     | DMA1_Stream3   | DMA1_Stream1     |
+
+### Logic Levels
+
+STM32 outputs 3.3V but WS2812 expects VIH > 0.7×VDD (3.5V at 5V supply).
+For reliable operation:
+- Use level shifter (SN74LVC1G125), OR
+- Use 330Ω series resistor + 4.5V LED supply, OR
+- Use open-drain with 1K pull-up to 5V
+
+## API Reference
+
+### Core Functions
+
+```cpp
+ARGB_Attach(&htim, channel, &hdma, timer_clock_hz); // Bind to timer/DMA
+ARGB_Init();                          // Initialize timing
+ARGB_SetBrightness(0-255);            // Global brightness
+ARGB_SetRGB(pixel, r, g, b);          // Set pixel color
+ARGB_SetHSV(pixel, h, s, v);          // Set pixel HSV
+ARGB_FillRGB(r, g, b);                // Fill all pixels
+ARGB_Clear();                         // Turn off all pixels
+ARGB_Show();                          // Send to strip (non-blocking)
+ARGB_Ready();                         // Check if ready for new frame
+```
+
+### Auto-Configuration (ARGB_Auto.h)
+
+```cpp
+ARGB_AnalyzePin(pin, &config);        // Get TIM/DMA config for pin
+ARGB_IsPinSupported(pin);             // Quick check
+ARGB_PrintPinConfig(pin);             // Debug output to Serial
+```
+
+## Memory Usage
+
+| Pixels | PWM Buffer | RGB Buffer | Total |
+|--------|------------|------------|-------|
+| 4      | 576 bytes  | 12 bytes   | ~600 B |
+| 16     | 1.6 KB     | 48 bytes   | ~1.7 KB |
+| 60     | 5.8 KB     | 180 bytes  | ~6 KB |
+| 144    | 14 KB      | 432 bytes  | ~14.5 KB |
+
+Formula: `PWM_BUF = (NUM_PIXELS × 24 + 48) × 4 bytes`
+
+## DMA Mapping Tables
+
+Currently supported:
+- ✅ STM32F4xx (F401, F405, F407, F411, F446, etc.)
+- ⏳ STM32F1xx (planned)
+- ⏳ STM32G4xx (planned)
+
+To request support for other chips, open an issue with:
+1. Chip model (e.g., STM32G431)
+2. DMA request mapping table from Reference Manual
+
+## Troubleshooting
+
+### "Pin doesn't support PWM"
+- Check that pin has TIM alternate function (see datasheet)
+- Some pins support multiple timers - try `_ALT1` variant
+
+### No signal / Constant HIGH
+- Verify DMA stream is correct for your TIM channel
+- Check DMA data alignment (WORD for TIM2/TIM5)
+- Ensure GPIO is in AF mode with correct AF number
+
+### Signal looks correct but LEDs don't work
+- Check logic levels (3.3V vs 5V)
+- Verify timing with oscilloscope (T0H ~350ns, T1H ~700ns)
+- Try shorter wires / add 100-470Ω series resistor
+
+### DMA conflicts
+- Use `ARGB_DMA_Map_F4_Alt[]` for alternate stream
+- Or manually configure with different stream
+
+## License
+
+MIT License - see LICENSE file
+
+## Credits
+
+- **Original library**: [Crazy-Geeks/STM32-ARGB-DMA](https://github.com/Crazy-Geeks/STM32-ARGB-DMA) by Dmitriy Semenov (Crazy_Geeks)
+- **Arduino/STM32duino port**: DashyFox
+  - Runtime TIM/DMA binding (`ARGB_Attach()`)
+  - Automatic pin configuration (`ARGB_Auto.h`)
+  - Arduino-friendly API (`ARGB_Begin()`)
